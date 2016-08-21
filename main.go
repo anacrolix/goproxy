@@ -17,8 +17,14 @@ var flags struct {
 }
 
 type Frontend struct {
-	Addr string
-	TLS  bool
+	Addr     string
+	TLS      bool
+	Redirect *Redirect
+}
+
+type Redirect struct {
+	Scheme string
+	Port   int
 }
 
 type Backend struct {
@@ -59,20 +65,44 @@ type handler struct {
 	Frontend Frontend
 }
 
+var hc = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	be := backendForRequest(r)
 	u := httptoo.CopyURL(r.URL)
+	if rd := h.Frontend.Redirect; rd != nil {
+		if rd.Scheme != "" {
+			u.Scheme = rd.Scheme
+		}
+		if rd.Port != 0 {
+			hmp := missinggo.SplitHostMaybePort(r.Host)
+			if hmp.Err != nil {
+				panic(hmp.Err)
+			}
+			hmp.Port = rd.Port
+			hmp.NoPort = false
+			u.Host = hmp.String()
+		} else {
+			u.Host = r.Host
+		}
+		http.Redirect(w, r, u.String(), http.StatusFound)
+		return
+	}
+	be := backendForRequest(r)
 	u.Scheme = "http"
 	u.Host = be.Addr
-	err := httptoo.ReverseProxy(w, r, u.String(), &http.Client{
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	})
+	err := httptoo.ReverseProxy(w, r, u.String(), hc)
 	if err != nil {
 		log.Printf("error proxying a request: %s", err)
 		http.Error(w, "proxy error", http.StatusInternalServerError)
 	}
+}
+
+func handleFrontendServeError(err error, frontendName string) {
+	log.Fatalf("error serving frontend %q: %s", frontendName, err)
 }
 
 func main() {
@@ -94,8 +124,11 @@ func main() {
 			}
 			srv.TLSConfig.BuildNameToCertificate()
 			go func() {
-				err := srv.ListenAndServeTLS("", "")
-				log.Fatalf("error serving frontend %q: %s", name, err)
+				handleFrontendServeError(srv.ListenAndServeTLS("", ""), name)
+			}()
+		} else {
+			go func() {
+				handleFrontendServeError(srv.ListenAndServe(), name)
 			}()
 		}
 	}
