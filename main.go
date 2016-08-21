@@ -92,6 +92,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("error loading certificates from %q: %s", "certs", err)
 			}
+			srv.TLSConfig.BuildNameToCertificate()
 			go func() {
 				err := srv.ListenAndServeTLS("", "")
 				log.Fatalf("error serving frontend %q: %s", name, err)
