@@ -32,13 +32,13 @@ type Backend struct {
 	Addr  string
 }
 
-var config struct {
+type Config struct {
 	DefaultBackend string
 	Frontends      map[string]Frontend
 	Backends       map[string]Backend
 }
 
-func loadConfig() {
+func loadConfig() (config Config) {
 	f, err := os.Open(flags.C)
 	if err != nil {
 		log.Fatalf("error opening config file: %s", err)
@@ -48,21 +48,12 @@ func loadConfig() {
 	if err != nil {
 		log.Fatalf("error decoding config: %s", err)
 	}
-}
-
-func backendForRequest(r *http.Request) Backend {
-	for _, be := range config.Backends {
-		for _, h := range be.Hosts {
-			if h == r.Host {
-				return be
-			}
-		}
-	}
-	return config.Backends[config.DefaultBackend]
+	return
 }
 
 type handler struct {
-	Frontend Frontend
+	Frontend
+	Config Config
 }
 
 var hc = &http.Client{
@@ -71,7 +62,23 @@ var hc = &http.Client{
 	},
 }
 
+func (h handler) backendForRequest(r *http.Request) *Backend {
+	for _, be := range h.Config.Backends {
+		for _, h := range be.Hosts {
+			if h == r.Host {
+				return &be
+			}
+		}
+	}
+	be, ok := h.Config.Backends[h.Config.DefaultBackend]
+	if !ok {
+		return nil
+	}
+	return &be
+}
+
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Printf("got request for %q", httptoo.RequestedURL(r).String())
 	u := httptoo.CopyURL(r.URL)
 	if rd := h.Frontend.Redirect; rd != nil {
 		if rd.Scheme != "" {
@@ -91,7 +98,12 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, u.String(), http.StatusFound)
 		return
 	}
-	be := backendForRequest(r)
+	be := h.backendForRequest(r)
+	if be == nil {
+		log.Printf("%q: no backend", httptoo.RequestedURL(r))
+		http.Error(w, "no backend", http.StatusServiceUnavailable)
+		return
+	}
 	u.Scheme = "http"
 	u.Host = be.Addr
 	err := httptoo.ReverseProxy(w, r, u.String(), hc)
@@ -108,12 +120,12 @@ func handleFrontendServeError(err error, frontendName string) {
 func main() {
 	log.SetFlags(log.Flags() | log.Lshortfile)
 	tagflag.Parse(&flags)
-	loadConfig()
+	config := loadConfig()
 	// log.Printf("%#v", config)
 	for name, fe := range config.Frontends {
 		srv := http.Server{
 			Addr:    fe.Addr,
-			Handler: handler{fe},
+			Handler: handler{fe, config},
 		}
 		if fe.TLS {
 			srv.TLSConfig = &tls.Config{}
