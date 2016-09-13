@@ -12,30 +12,27 @@ import (
 	"github.com/naoina/toml"
 )
 
-var flags struct {
-	C string
-}
+var (
+	flags struct {
+		C string
+	}
+	clients map[string]*http.Client
+)
 
-type Frontend struct {
-	Addr     string
-	TLS      bool
-	Redirect *Redirect
-}
-
-type Redirect struct {
-	Scheme string
-	Port   int
-}
-
-type Backend struct {
-	Hosts []string
-	Addr  string
-}
-
-type Config struct {
-	DefaultBackend string
-	Frontends      map[string]Frontend
-	Backends       map[string]Backend
+func createClients(cfg Config) {
+	for name, c := range cfg.Clients {
+		hc := &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		t := http.Transport{}
+		tcc := tls.Config{}
+		tcc.InsecureSkipVerify = c.SkipVerify
+		t.TLSClientConfig = &tcc
+		hc.Transport = &t
+		clients[name] = hc
+	}
 }
 
 func loadConfig() (config Config) {
@@ -56,12 +53,6 @@ type handler struct {
 	Config Config
 }
 
-var hc = &http.Client{
-	CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
-
 func (h handler) backendForRequest(r *http.Request) *Backend {
 	for _, be := range h.Config.Backends {
 		for _, h := range be.Hosts {
@@ -80,7 +71,8 @@ func (h handler) backendForRequest(r *http.Request) *Backend {
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("got request for %q", httptoo.RequestedURL(r).String())
 	u := httptoo.CopyURL(r.URL)
-	if rd := h.Frontend.Redirect; rd != nil {
+	be := h.backendForRequest(r)
+	if rd := be.Redirect; rd != nil {
 		if rd.Scheme != "" {
 			u.Scheme = rd.Scheme
 		}
@@ -98,15 +90,17 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, u.String(), http.StatusFound)
 		return
 	}
-	be := h.backendForRequest(r)
 	if be == nil {
 		log.Printf("%q: no backend", httptoo.RequestedURL(r))
 		http.Error(w, "no backend", http.StatusServiceUnavailable)
 		return
 	}
 	u.Scheme = "http"
+	if be.Scheme != "" {
+		u.Scheme = be.Scheme
+	}
 	u.Host = be.Addr
-	err := httptoo.ReverseProxy(w, r, u.String(), hc)
+	err := httptoo.ReverseProxy(w, r, u.String(), clients[be.Client])
 	if err != nil {
 		log.Printf("error proxying a request: %s", err)
 		http.Error(w, "proxy error", http.StatusInternalServerError)
