@@ -36,6 +36,14 @@ func init() {
 	})
 }
 
+// Client that doesn't follow redirects, so we can check the immediate
+// response from Proxy.
+var rawClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 func testOriginHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("got request at origin for %q", httptoo.RequestedURL(r))
 	testOriginMuxer.ServeHTTP(w, r)
@@ -67,19 +75,19 @@ func testClientRedirected(t *testing.T, addr string) {
 	t.Log(resp.Status)
 }
 
-func testSimpleClient(t *testing.T, hostPath string) {
-	resp, err := http.Get("http://" + hostPath)
+func testSimpleClient(t *testing.T, hostPath string, expectedResponseCode int, expectedBody string) {
+	resp, err := rawClient.Get("http://" + hostPath)
 	require.NoError(t, err)
-	assert.EqualValues(t, 200, resp.StatusCode)
+	assert.EqualValues(t, expectedResponseCode, resp.StatusCode)
 	var buf bytes.Buffer
 	io.Copy(&buf, resp.Body)
-	assert.EqualValues(t, "hello", buf.Bytes())
+	assert.EqualValues(t, expectedBody, buf.String())
 }
 
 func testClient(t *testing.T, addr string) {
 	testWebsocketClient(t, addr+"/ws")
-	testSimpleClient(t, addr+"/simple")
-	testSimpleClient(t, addr+"/redirect")
+	testSimpleClient(t, addr+"/simple", 200, "hello")
+	testSimpleClient(t, addr+"/redirect", 307, "<a href=\"/simple\">Temporary Redirect</a>.\n\n")
 }
 
 func TestWebsocket(t *testing.T) {
@@ -89,14 +97,41 @@ func TestWebsocket(t *testing.T) {
 	go http.Serve(originListener, http.HandlerFunc(testOriginHandler))
 	proxyListener, err := net.Listen("tcp", "localhost:0")
 	require.NoError(t, err)
-	go http.Serve(proxyListener, handler{
-		Config: Config{
-			Backends: map[string]Backend{
-				"": Backend{
-					Addr: originListener.Addr().String(),
-				},
+	defer proxyListener.Close()
+	proxy := NewProxy(Config{
+		Backends: map[string]Backend{
+			"": Backend{
+				Addr: originListener.Addr().String(),
 			},
 		},
+	})
+	go http.Serve(proxyListener, handler{
+		Proxy: proxy,
+	})
+	testClient(t, proxyListener.Addr().String())
+}
+
+func TestRedirectPassedThrough(t *testing.T) {
+	originListener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	defer originListener.Close()
+	go http.Serve(originListener, http.HandlerFunc(testOriginHandler))
+	proxyListener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	defer proxyListener.Close()
+	proxy := NewProxy(Config{
+		Backends: map[string]Backend{
+			"": Backend{
+				Addr:   originListener.Addr().String(),
+				Client: "herp",
+			},
+		},
+		Clients: map[string]Client{
+			"herp": Client{},
+		},
+	})
+	go http.Serve(proxyListener, handler{
+		Proxy: proxy,
 	})
 	testClient(t, proxyListener.Addr().String())
 }
